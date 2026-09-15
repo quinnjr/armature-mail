@@ -54,9 +54,15 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # a `Vec<u8>` serialized as a JSON number array costs ~4 bytes per source byte.
 base64 = "0.23"
 
+# SDK default features are off to drop the legacy hyper-0.14 client and its
+# h2 0.3 (RUSTSEC-2026-0258); the hyper-1 `default-https-client` is kept.
 # AWS SES
-aws-sdk-sesv2 = { version = "1.133", optional = true }
+aws-sdk-sesv2 = { version = "1.133", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"], optional = true }
 aws-config = { version = "1.12", optional = true }
+# Held below 1.7 so a fresh resolve (Cargo.lock is not committed) picks the
+# aws-sdk-*/aws-runtime releases that still build with aws-config 1.12's
+# aws-smithy-json 0.63. Drop this once aws-config moves to aws-smithy-json 0.64.
+aws-smithy-types = { version = ">=1.6.3, <1.7", optional = true }
 
 # Redis for email queue
 armature-redis = { version = "0.2", optional = true }
@@ -82,7 +88,7 @@ tera = ["dep:tera"]
 minijinja = ["dep:minijinja"]
 sendgrid = ["reqwest"]
 mailgun = ["reqwest"]
-ses = ["aws-sdk-sesv2", "aws-config"]
+ses = ["aws-smithy-types", "aws-sdk-sesv2", "aws-config"]
 queue = ["chrono"]
 redis = ["queue", "armature-redis", "dep:redis"]
 all-providers = ["sendgrid", "mailgun", "ses"]
