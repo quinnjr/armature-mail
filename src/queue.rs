@@ -203,7 +203,27 @@ pub struct EmailQueueConfig {
     /// without bound. Ignored by [`RedisBackend`], whose bound is Redis's own
     /// memory policy.
     pub max_queue_depth: usize,
+    /// How long a dead-lettered job is retained (default: 7 days).
+    ///
+    /// Dead-lettered jobs carry the full email -- password-reset links, magic
+    /// login links, attachments -- so the dead-letter queue must not keep them
+    /// forever. [`InMemoryBackend`] drops each entry this long after it was
+    /// dead-lettered; [`RedisBackend`] sets this as the TTL of the whole
+    /// dead-letter list, refreshed on every new entry (a Redis list has no
+    /// per-element expiry), so a quiet DLQ empties itself `dead_letter_ttl`
+    /// after its last failure. Must be non-zero.
+    pub dead_letter_ttl: Duration,
+    /// Maximum number of jobs kept in the dead-letter queue (default: 1 000).
+    ///
+    /// Both backends drop the oldest entry once the cap is reached.
+    pub dead_letter_max_len: usize,
 }
+
+/// Default for [`EmailQueueConfig::dead_letter_ttl`]: 7 days.
+pub const DEFAULT_DEAD_LETTER_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Default for [`EmailQueueConfig::dead_letter_max_len`].
+pub const DEFAULT_DEAD_LETTER_MAX_LEN: usize = 1_000;
 
 impl Default for EmailQueueConfig {
     fn default() -> Self {
@@ -218,6 +238,8 @@ impl Default for EmailQueueConfig {
             job_timeout: Duration::from_secs(60),
             visibility_timeout: Duration::from_secs(300),
             max_queue_depth: 10_000,
+            dead_letter_ttl: DEFAULT_DEAD_LETTER_TTL,
+            dead_letter_max_len: DEFAULT_DEAD_LETTER_MAX_LEN,
         }
     }
 }
@@ -288,6 +310,21 @@ impl EmailQueueConfig {
         self
     }
 
+    /// Set how long dead-lettered jobs are retained (default: 7 days).
+    ///
+    /// See [`Self::dead_letter_ttl`](field@Self::dead_letter_ttl) for how each
+    /// backend applies it. A zero TTL is rejected by [`Self::validate`].
+    pub fn dead_letter_ttl(mut self, ttl: Duration) -> Self {
+        self.dead_letter_ttl = ttl;
+        self
+    }
+
+    /// Set the maximum number of dead-lettered jobs retained (default: 1 000).
+    pub fn dead_letter_max_len(mut self, max_len: usize) -> Self {
+        self.dead_letter_max_len = max_len.max(1);
+        self
+    }
+
     /// Reject a configuration the queue cannot honor.
     ///
     /// [`Self::visibility_timeout`] must be more than twice
@@ -327,6 +364,21 @@ impl EmailQueueConfig {
                 "batch_size must be at least 1; a queue that never fetches jobs cannot make \
                  progress"
                     .to_string(),
+            ));
+        }
+        // A zero TTL would make Redis's `PEXPIRE 0` delete the dead-letter
+        // list the instant it is written -- the DLQ would silently record
+        // nothing. Disable it with `dead_letter_queue(false)` instead.
+        if self.dead_letter_ttl.is_zero() {
+            return Err(MailError::Config(
+                "dead_letter_ttl must be non-zero; use dead_letter_queue(false) to disable \
+                 the dead-letter queue"
+                    .to_string(),
+            ));
+        }
+        if self.dead_letter_max_len == 0 {
+            return Err(MailError::Config(
+                "dead_letter_max_len must be at least 1".to_string(),
             ));
         }
         if self.concurrency == 0 {
@@ -496,8 +548,12 @@ pub struct QueueStats {
 pub struct InMemoryBackend {
     state: tokio::sync::Mutex<InMemoryState>,
     processed: std::sync::atomic::AtomicU64,
-    /// Cap on the queue and, separately, on the dead-letter list.
+    /// Cap on the pending queue.
     max_depth: usize,
+    /// Cap on the dead-letter list ([`EmailQueueConfig::dead_letter_max_len`]).
+    dead_letter_max_len: usize,
+    /// Retention of dead-letter entries ([`EmailQueueConfig::dead_letter_ttl`]).
+    dead_letter_ttl: Duration,
     /// Mirrors [`EmailQueueConfig::dead_letter_queue`]; `reclaim_stale` must
     /// honor it the same way the normal worker-exhaustion path does, rather
     /// than dead-lettering unconditionally.
@@ -520,9 +576,11 @@ struct InMemoryState {
     /// from a claim this entry has since superseded is rejected as stale
     /// rather than tearing down the current one.
     processing: std::collections::HashMap<String, (i64, u64, EmailJob)>,
-    /// Bounded — every retained job holds an `Arc<Email>` with full
-    /// attachments, so a steadily failing queue must not grow it without limit.
-    dead_letter: std::collections::VecDeque<EmailJob>,
+    /// Bounded in length and age — every retained job holds an `Arc<Email>`
+    /// with full attachments (and often a reset or login link), so a steadily
+    /// failing queue must not grow it without limit, nor keep entries forever.
+    /// Each entry carries the instant it was dead-lettered.
+    dead_letter: std::collections::VecDeque<(tokio::time::Instant, EmailJob)>,
     /// Monotonic source for claim fencing tokens. `0` is reserved to mean
     /// "unclaimed" ([`EmailJob::new`]'s default), so the first real token is 1.
     claim_seq: u64,
@@ -541,16 +599,33 @@ impl InMemoryState {
     ///
     /// Evict rather than reject: a full DLQ must not start silently dropping the
     /// failures it exists to record.
-    fn push_dead_letter(&mut self, job: EmailJob, max_depth: usize) {
-        while self.dead_letter.len() >= max_depth {
-            if let Some(evicted) = self.dead_letter.pop_front() {
+    fn push_dead_letter(&mut self, job: EmailJob, max_len: usize, ttl: Duration) {
+        self.expire_dead_letters(ttl);
+        while self.dead_letter.len() >= max_len {
+            if let Some((_, evicted)) = self.dead_letter.pop_front() {
                 warn!(
                     job_id = %evicted.id,
                     "Dead letter queue full; evicting the oldest entry"
                 );
             }
         }
-        self.dead_letter.push_back(job);
+        self.dead_letter
+            .push_back((tokio::time::Instant::now(), job));
+    }
+
+    /// Drop dead-letter entries older than `ttl`. Entries are appended in time
+    /// order, so the expired ones are a prefix.
+    fn expire_dead_letters(&mut self, ttl: Duration) {
+        let now = tokio::time::Instant::now();
+        while self
+            .dead_letter
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= ttl)
+        {
+            if let Some((_, expired)) = self.dead_letter.pop_front() {
+                debug!(job_id = %expired.id, "Dead letter entry expired");
+            }
+        }
     }
 }
 
@@ -575,8 +650,21 @@ impl InMemoryBackend {
             state: tokio::sync::Mutex::new(InMemoryState::default()),
             processed: std::sync::atomic::AtomicU64::new(0),
             max_depth: max_depth.max(1),
+            dead_letter_max_len: DEFAULT_DEAD_LETTER_MAX_LEN,
+            dead_letter_ttl: DEFAULT_DEAD_LETTER_TTL,
             dead_letter_queue_enabled: true,
         }
+    }
+
+    /// Set how many dead-lettered jobs are kept and for how long (defaults:
+    /// [`DEFAULT_DEAD_LETTER_MAX_LEN`] and [`DEFAULT_DEAD_LETTER_TTL`]).
+    ///
+    /// The oldest entry is evicted once `max_len` is reached, and each entry
+    /// is dropped `ttl` after it was dead-lettered.
+    pub fn dead_letter_retention(mut self, ttl: Duration, max_len: usize) -> Self {
+        self.dead_letter_ttl = ttl;
+        self.dead_letter_max_len = max_len.max(1);
+        self
     }
 
     /// Set whether `reclaim_stale` dead-letters exhausted jobs (default: `true`,
@@ -591,14 +679,15 @@ impl InMemoryBackend {
         self
     }
 
-    /// Snapshot of the dead-letter list, oldest first.
+    /// Snapshot of the dead-letter list, oldest first. Expired entries (see
+    /// [`Self::dead_letter_retention`]) are dropped first.
     pub async fn dead_letter_jobs(&self) -> Vec<EmailJob> {
-        self.state
-            .lock()
-            .await
+        let mut state = self.state.lock().await;
+        state.expire_dead_letters(self.dead_letter_ttl);
+        state
             .dead_letter
             .iter()
-            .cloned()
+            .map(|(_, job)| job.clone())
             .collect()
     }
 }
@@ -755,7 +844,7 @@ impl EmailQueueBackend for InMemoryBackend {
             return Ok(());
         }
         state.processing.remove(&job.id);
-        state.push_dead_letter(job, self.max_depth);
+        state.push_dead_letter(job, self.dead_letter_max_len, self.dead_letter_ttl);
         Ok(())
     }
 
@@ -807,7 +896,11 @@ impl EmailQueueBackend for InMemoryBackend {
                     );
                     // The dead-letter list evicts at the cap rather than
                     // rejecting, so this path is never blocked by `max_depth`.
-                    state.push_dead_letter(reclaimed_job, self.max_depth);
+                    state.push_dead_letter(
+                        reclaimed_job,
+                        self.dead_letter_max_len,
+                        self.dead_letter_ttl,
+                    );
                 } else {
                     error!(
                         job_id = %reclaimed_job.id,
@@ -853,7 +946,9 @@ impl EmailQueueBackend for InMemoryBackend {
     }
 
     async fn stats(&self) -> Result<QueueStats> {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        state.expire_dead_letters(self.dead_letter_ttl);
+        let dead_letter_len = state.dead_letter.len() as u64;
         let queue = &state.queue;
         let processing = state.processing.len() as u64;
         let now = chrono_now_ms();
@@ -871,7 +966,7 @@ impl EmailQueueBackend for InMemoryBackend {
             pending,
             processing,
             retrying,
-            dead_letter: state.dead_letter.len() as u64,
+            dead_letter: dead_letter_len,
             processed: self.processed.load(std::sync::atomic::Ordering::Relaxed),
         })
     }
@@ -931,14 +1026,19 @@ const FAIL_IF_OWNED: &str = r#"
 
 /// Move the job to the dead-letter list, for the current claim's owner only.
 ///
+/// The list is trimmed to the newest `max_len` entries and its TTL refreshed,
+/// so dead-lettered emails (reset links, attachments) are not kept forever.
+///
 /// `KEYS = [processing, dead_letter, job, claim]`, `ARGV = [job_id, body,
-/// claim_token]`.
+/// claim_token, max_len, ttl_ms]`.
 #[cfg(feature = "redis")]
 const DEAD_LETTER_IF_OWNED: &str = r#"
     if redis.call('HGET', KEYS[4], ARGV[1]) == ARGV[3] then
         redis.call('ZREM', KEYS[1], ARGV[1])
         redis.call('HDEL', KEYS[4], ARGV[1])
         redis.call('LPUSH', KEYS[2], ARGV[2])
+        redis.call('LTRIM', KEYS[2], 0, tonumber(ARGV[4]) - 1)
+        redis.call('PEXPIRE', KEYS[2], ARGV[5])
         redis.call('DEL', KEYS[3])
         return 1
     end
@@ -1055,6 +1155,27 @@ impl RedisBackend {
         format!("{}:dead", self.config.queue_name)
     }
 
+    /// [`EmailQueueConfig::dead_letter_ttl`] in milliseconds, at least 1 so a
+    /// sub-millisecond TTL cannot become `PEXPIRE 0` (immediate deletion).
+    fn dead_letter_ttl_ms(&self) -> u64 {
+        u64::try_from(self.config.dead_letter_ttl.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    /// Queue the trim-and-expire that bounds the dead-letter list onto `pipe`,
+    /// after an `LPUSH` to it.
+    fn bound_dead_letter(&self, pipe: &mut redis::Pipeline) {
+        let max_len = self.config.dead_letter_max_len.max(1) as i64;
+        pipe.cmd("LTRIM")
+            .arg(self.dead_letter_key())
+            .arg(0)
+            .arg(max_len - 1);
+        pipe.cmd("PEXPIRE")
+            .arg(self.dead_letter_key())
+            .arg(self.dead_letter_ttl_ms());
+    }
+
     fn job_key(&self, id: &str) -> String {
         format!("{}:job:{}", self.config.queue_name, id)
     }
@@ -1156,6 +1277,7 @@ impl RedisBackend {
             pipe.cmd("LPUSH").arg(self.lost_key()).arg(&stub);
             if self.config.dead_letter_queue {
                 pipe.cmd("LPUSH").arg(self.dead_letter_key()).arg(&stub);
+                self.bound_dead_letter(&mut pipe);
             }
             pipe.cmd("DEL").arg(self.job_key(id));
 
@@ -1610,6 +1732,7 @@ impl EmailQueueBackend for RedisBackend {
                         pipe.cmd("LPUSH").arg(self.lost_key()).arg(&stub);
                         if self.config.dead_letter_queue {
                             pipe.cmd("LPUSH").arg(self.dead_letter_key()).arg(&stub);
+                            self.bound_dead_letter(&mut pipe);
                         }
                         pipe.query_async::<()>(&mut conn)
                             .await
@@ -1679,6 +1802,8 @@ impl EmailQueueBackend for RedisBackend {
                         .arg(id)
                         .arg(&body)
                         .arg(token)
+                        .arg(self.config.dead_letter_max_len.max(1))
+                        .arg(self.dead_letter_ttl_ms())
                         .query_async(&mut conn)
                         .await
                         .map_err(|e| MailError::Queue(e.to_string()))?
@@ -1787,6 +1912,8 @@ impl EmailQueueBackend for RedisBackend {
             .arg(&job.id)
             .arg(&job_json)
             .arg(job.claim_token)
+            .arg(self.config.dead_letter_max_len.max(1))
+            .arg(self.dead_letter_ttl_ms())
             .query_async(&mut conn)
             .await
             .map_err(|e| MailError::Queue(e.to_string()))?;
@@ -1875,7 +2002,8 @@ impl EmailQueue {
         Ok(Self {
             backend: Arc::new(
                 InMemoryBackend::with_max_depth(config.max_queue_depth)
-                    .dead_letter_queue(config.dead_letter_queue),
+                    .dead_letter_queue(config.dead_letter_queue)
+                    .dead_letter_retention(config.dead_letter_ttl, config.dead_letter_max_len),
             ),
             config,
         })
@@ -2622,7 +2750,10 @@ mod tests {
     /// attachments.
     #[tokio::test]
     async fn the_in_memory_backend_is_bounded() {
-        let backend = InMemoryBackend::with_max_depth(2);
+        // The pending queue is capped by `max_depth`; the dead-letter list by
+        // its own `dead_letter_max_len`.
+        let backend =
+            InMemoryBackend::with_max_depth(2).dead_letter_retention(DEFAULT_DEAD_LETTER_TTL, 2);
 
         backend.push(EmailJob::new(queued_email())).await.unwrap();
         backend.push(EmailJob::new(queued_email())).await.unwrap();
@@ -2769,6 +2900,42 @@ mod tests {
             backend.stats().await.unwrap().pending,
             0,
             "none of the rejected batch may have been enqueued"
+        );
+    }
+
+    /// Dead-lettered jobs carry full emails (reset links, attachments), so the
+    /// DLQ is bounded in length and drops entries once they pass the TTL.
+    #[tokio::test(start_paused = true)]
+    async fn dead_letter_entries_expire_and_are_capped() {
+        let backend = InMemoryBackend::new().dead_letter_retention(Duration::from_secs(60), 2);
+
+        for _ in 0..3 {
+            backend.push(EmailJob::new(queued_email())).await.unwrap();
+        }
+        for job in backend.pop(3).await.unwrap() {
+            backend.dead_letter(job).await.unwrap();
+        }
+        assert_eq!(
+            backend.stats().await.unwrap().dead_letter,
+            2,
+            "the dead-letter list must be capped at dead_letter_max_len"
+        );
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert_eq!(backend.stats().await.unwrap().dead_letter, 0);
+        assert!(backend.dead_letter_jobs().await.is_empty());
+    }
+
+    #[test]
+    fn dead_letter_retention_has_bounded_defaults_and_rejects_zero_ttl() {
+        let config = EmailQueueConfig::default();
+        assert_eq!(config.dead_letter_ttl, DEFAULT_DEAD_LETTER_TTL);
+        assert_eq!(config.dead_letter_max_len, DEFAULT_DEAD_LETTER_MAX_LEN);
+        assert!(
+            EmailQueueConfig::default()
+                .dead_letter_ttl(Duration::ZERO)
+                .validate()
+                .is_err()
         );
     }
 

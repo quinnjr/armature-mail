@@ -454,6 +454,39 @@ impl Email {
     }
 }
 
+/// Structural headers a custom header may not set.
+///
+/// Each is owned by a typed [`Email`] field (or by the MIME encoder), so letting
+/// [`Email::header`] set it would allow silently adding recipients (`Bcc`),
+/// spoofing the sender (`From`, `Sender`, `Reply-To`, `Return-Path`), or
+/// corrupting the MIME structure (`Content-*`, `MIME-Version`). Matched
+/// case-insensitively; every `Content-` prefixed name is also refused.
+const RESERVED_HEADERS: &[&str] = &[
+    "to",
+    "cc",
+    "bcc",
+    "from",
+    "sender",
+    "reply-to",
+    "return-path",
+    "subject",
+    "date",
+    "message-id",
+    "in-reply-to",
+    "references",
+    "mime-version",
+];
+
+/// Whether `name` is a structural header [`Email::header`] refuses to set.
+fn is_reserved_header(name: &str) -> bool {
+    RESERVED_HEADERS
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        || name
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("content-"))
+}
+
 /// Validate a custom header name and value.
 ///
 /// Header names must be non-empty RFC 5322 `field-name` tokens: printable ASCII
@@ -461,6 +494,18 @@ impl Email {
 /// ASCII control character — a `\r\n` in a value lets a caller append arbitrary
 /// headers (`Bcc:`, `Content-Type:`) to the message on any transport that writes
 /// the value verbatim.
+///
+/// Structural headers are refused outright: `To`, `Cc`, `Bcc`, `From`,
+/// `Sender`, `Reply-To`, `Return-Path`, `Subject`, `Date`, `Message-ID`,
+/// `In-Reply-To`, `References`, `MIME-Version` and any `Content-*` header. Set
+/// those through the typed [`Email`] builders instead.
+///
+/// ```
+/// use armature_mail::validate_header;
+///
+/// assert!(validate_header("X-Campaign", "spring").is_ok());
+/// assert!(validate_header("Bcc", "attacker@example.com").is_err());
+/// ```
 pub fn validate_header(name: &str, value: &str) -> Result<()> {
     if name.is_empty() {
         return Err(MailError::Config("Header name cannot be empty".to_string()));
@@ -472,6 +517,13 @@ pub fn validate_header(name: &str, value: &str) -> Result<()> {
         return Err(MailError::Config(format!(
             "Invalid character {:?} in header name {:?}",
             c, name
+        )));
+    }
+    if is_reserved_header(name) {
+        return Err(MailError::Config(format!(
+            "Header {:?} is structural and cannot be set as a custom header; \
+             use the typed Email builder for it",
+            name
         )));
     }
     validate_header_value(name, value)
@@ -953,6 +1005,43 @@ mod tests {
             .in_reply_to("<parent@example.com>")
             .reference("<root@example.com>");
         assert!(email.validate().is_ok());
+    }
+
+    #[test]
+    fn structural_headers_are_refused_as_custom_headers() {
+        for name in [
+            "To",
+            "cc",
+            "BCC",
+            "From",
+            "Sender",
+            "Reply-To",
+            "Return-Path",
+            "Subject",
+            "Date",
+            "Message-ID",
+            "MIME-Version",
+            "Content-Type",
+            "content-transfer-encoding",
+            "Content-Disposition",
+        ] {
+            assert!(
+                validate_header(name, "v").is_err(),
+                "{name} must be refused"
+            );
+            let email = base().header(name, "attacker@example.com");
+            assert!(email.validate().is_err(), "{name} must fail validation");
+            assert!(
+                email
+                    .wire_headers()
+                    .iter()
+                    .all(|(n, _)| !n.eq_ignore_ascii_case(name)),
+                "{name} must never reach the wire"
+            );
+        }
+        // Lookalikes that merely contain a reserved name are fine.
+        assert!(validate_header("X-Original-To", "v").is_ok());
+        assert!(validate_header("Contents", "v").is_ok());
     }
 
     #[test]
