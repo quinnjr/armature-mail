@@ -135,8 +135,9 @@ pub use mailgun::{MailgunConfig, MailgunTransport};
 
 #[cfg(feature = "queue")]
 pub use queue::{
-    EmailJob, EmailQueue, EmailQueueBackend, EmailQueueConfig, EmailQueueWorker, InMemoryBackend,
-    MAX_SERVER_RETRY_AFTER, MailerQueueExt, QueueStats,
+    DEFAULT_DEAD_LETTER_MAX_LEN, DEFAULT_DEAD_LETTER_TTL, EmailJob, EmailQueue, EmailQueueBackend,
+    EmailQueueConfig, EmailQueueWorker, InMemoryBackend, MAX_SERVER_RETRY_AFTER, MailerQueueExt,
+    QueueStats,
 };
 
 #[cfg(feature = "redis")]
