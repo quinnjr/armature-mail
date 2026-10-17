@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-17
+
 ### Security
 
 - **Breaking:** `Email::header` (and `validate_header`) refuse structural headers: `To`, `Cc`, `Bcc`, `From`, `Sender`, `Reply-To`, `Return-Path`, `Subject`, `Date`, `Message-ID`, `In-Reply-To`, `References`, `MIME-Version` and every `Content-*` header, matched case-insensitively. A custom header could otherwise silently add recipients or spoof the sender. Such a header is reported by `Email::validate` and never reaches the wire. Migration: use the typed builder methods (`bcc`, `reply_to`, `subject`, ...).
